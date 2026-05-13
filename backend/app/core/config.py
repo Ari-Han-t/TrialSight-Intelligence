@@ -1,3 +1,4 @@
+import logging
 from functools import lru_cache
 
 from pydantic import Field
@@ -5,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    app_name: str = "AI Research Paper Analyzer"
+    app_name: str = "TrialSight Intelligence"
     app_env: str = "development"
     jwt_secret: str = "change-this-in-production"
     jwt_algorithm: str = "HS256"
@@ -59,4 +60,9 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    if s.app_env != "development" and s.jwt_secret == "change-this-in-production":
+        logging.getLogger(__name__).warning(
+            "JWT_SECRET is set to the default value. Set a strong, unique secret for production."
+        )
+    return s
