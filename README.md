@@ -1,203 +1,224 @@
 # TrialSight Intelligence
 
-Clinical Trial Evidence Assistant built as a multi-user RAG system for reviewing trial PDFs, retrieving supporting evidence, and generating citation-grounded answers under strict cost and abuse controls.
+Clinical Trial Evidence Assistant — a product-focused RAG system for secure, citation-grounded interrogation of clinical trial PDFs.
 
-This is not a generic "chat with PDF" demo. It is a scoped product-style system designed around a real workflow:
+Live demo
+- Frontend (Vercel): https://trial-sight-intelligence.vercel.app/login?v=3
+- Backend (Render): https://trialsight-intelligence.onrender.com
 
-- upload trial documents
-- isolate data per user
-- retrieve relevant evidence
-- answer with citations
-- enforce hard rate limits before LLM spend happens
+Summary
+-------
+TrialSight is designed for focused document interrogation, not generic brainstorming. It combines a static frontend, a Dockerized FastAPI backend, hybrid retrieval (dense + keyword), and Groq LLM inference to produce evidence-backed answers with source citations while enforcing strict rate limits and per-user isolation.
 
-## Why It Stands Out
+Highlights
+- Upload PDFs and ingest into a chunked, source-traceable index
+- Hybrid retrieval: dense vectors + BM25 + reranking
+- Streaming, citation-aware answers (SSE/streaming API)
+- JWT-based auth and per-user data isolation
+- Cost controls and rate limiting (Redis optional)
+- Simple deploy path: Render (backend) + Vercel (frontend)
 
-- Niche use case: clinical trial evidence review
-- Multi-user architecture with JWT auth and per-user data isolation
-- Hybrid retrieval instead of plain keyword search
-- Cost-aware by design with Groq as the default LLM provider
-- Strict demo-safe rate limiting to protect against abuse and accidental spend
-- Lightweight deployment path without heavy local model infrastructure
+Architecture (high level)
+-------------------------
 
-## Core Capabilities
+Mermaid component diagram
 
-- PDF upload and ingestion
-- Chunked document processing with source-aware citations
-- Hybrid retrieval:
-  - hashed dense retrieval
-  - BM25 keyword search
-  - reranking
-- Query rewriting before retrieval
-- Citation-grounded answer generation
-- Streaming responses
-- Query history and evaluation logging
-- Cache-aware repeated question handling
+```mermaid
+graph LR
+  U[User Browser (Vercel Frontend)] -->|HTTP(S)| CDN[Vercel CDN]
+  CDN --> F[Static Frontend Files]
+  F -->|HTTPS: /auth, /upload, /ask| B[Render Backend (FastAPI)]
+  B --> DB[SQLite on persistent disk]
+  B --> RD[Redis (optional) – rate limiting]
+  B --> LLM[Groq LLM API]
+  B -->|stores| Index[Document Index (vectors + metadata)]
+  subgraph Cloud
+    LLM
+    RD
+  end
+```
 
-## Safety and Demo Controls
+Sequence: ask -> retrieve -> answer
 
-- JWT authentication
-- Per-user document isolation
-- Upload size limits
-- Upload/day limits
-- Query/minute and query/day limits
-- Global demo query caps
-- Groq request, token, and concurrency guards
-- Redis-backed rate limiting with in-memory fallback
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant F as Frontend
+  participant B as Backend
+  participant L as Groq
 
-## Tech Stack
+  U->>F: Click "Run evidence query"
+  F->>B: POST /ask/stream (Bearer token)
+  B->>B: Rewriting + Retrieval (dense + keyword)
+  B->>L: Request generation with retrieval context
+  L-->>B: Streaming chunks
+  B-->>F: Stream chunks (SSE-like)
+  F-->>U: Incremental display + citations
+```
 
-- FastAPI
-- SQLite
-- Redis (optional)
-- Groq
-- BM25 + lightweight dense retrieval
-- Static frontend
-- Docker
+Component responsibilities
+--------------------------
+- Frontend (frontend/)
+  - Static UI (login, upload, chat). Minimal JS; streaming client to render SSE-style responses.
+  - `frontend/config.js` controls `apiBase` (backend URL). When deploying, set this to your Render URL.
+- Backend (backend/)
+  - FastAPI app that handles auth, upload, ingestion, retrieval, and streaming completion endpoints.
+  - `render.yaml` contains the recommended Render configuration (docker, disk, health check).
+  - CORS controlled via `FRONTEND_ORIGINS` environment variable.
+- Index & Retrieval
+  - Documents are chunked and embedded into a lightweight vector store + BM25 index.
+  - Retrieval pipeline: dense search -> BM25 -> rerank -> final top-K passed to LLM.
+- LLM
+  - Groq is used by default (configurable via `GROQ_MODEL` and `GROQ_API_KEY`).
+- Rate limiting
+  - Redis-backed token buckets when `REDIS_URL` provided; otherwise an in-memory fallback.
 
-## Project Structure
+API quick reference
+-------------------
+- `POST /auth/signup` — create analyst account. Body: `{ "email": "x", "password": "y" }`
+- `POST /auth/login` — returns `{ access_token }`
+- `GET /auth/me` — returns user info (requires bearer)
+- `POST /upload` — multipart upload `files` (PDFs)
+- `POST /ask/stream` — streaming answer endpoint (SSE-style, requires bearer)
 
+Example: signup + ask flow (curl)
+
+```bash
+# signup
+curl -sS -X POST https://trialsight-intelligence.onrender.com/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"password123"}'
+
+# login -> save token
+TOKEN=$(curl -sS -X POST https://trialsight-intelligence.onrender.com/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","password":"password123"}' | jq -r .access_token)
+
+# ask (simplified non-streaming example)
+curl -sS -X POST https://trialsight-intelligence.onrender.com/ask \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What was the primary endpoint?"}'
+```
+
+Deployment (concise)
+--------------------
+
+Backend (Render)
+1. Deploy via the `render.yaml` blueprint (one-click) or create a Web Service (Docker).
+2. Ensure environment variables are set:
+   - `GROQ_API_KEY` — required for LLM
+   - `FRONTEND_ORIGINS` — include your Vercel URL(s), e.g. `https://trial-sight-intelligence.vercel.app`
+   - `APP_ENV=production`
+3. Add a 1GB disk at `/app/data` and enable health checks at `/health`.
+
+Frontend (Vercel)
+1. Import repo on Vercel and set **Root Directory** to `frontend`.
+2. Use `Other` framework preset (static). No build command needed — static files are committed.
+3. After deploying, update `frontend/config.js` `apiBase` to point at your Render backend, or set it using an environment file step before deploy.
+
+Keeping the backend warm
+-----------------------
+- Render free tier may spin down inactive services. Options to keep always-on:
+  - Upgrade to a paid Render plan (recommended for production)
+  - Create a Render Cron Job or external uptime monitor to ping `/health` every 5 minutes
+
+Operations & Troubleshooting
+----------------------------
+- CORS issues: ensure `FRONTEND_ORIGINS` includes the exact Vercel origin (match hostname).
+- Failed to fetch in browser: check DevTools Network tab; confirm `config.js` served by Vercel and `apiBase` is correct.
+- Rate-limited responses: check `X-RateLimit-*` headers and `REDIS_URL` settings.
+
+Repository layout
+-----------------
 ```text
 backend/
+  Dockerfile
+  main.py
   app/
     api/
     core/
     models/
     rag/
     rate_limit/
-    schemas/
     services/
 frontend/
-docker-compose.yml
-render.yaml
+  login.html
+  chat.html
+  styles.css
+  config.js
+vercel.json  # top-level rewrite (optional)
+render.yaml  # Render service blueprint
 ```
 
-## Local Run
+Contributing
+------------
+- Bug reports & PRs welcome. Follow these steps:
+  1. Fork repository
+  2. Create a feature branch
+  3. Include tests for non-trivial logic
+  4. Open PR describing your change
 
-### Backend
+Security & privacy notes
+------------------------
+- This project is for demonstration and research. DO NOT deploy with default `JWT_SECRET` in production.
+- Uploaded PDFs are stored on the Render disk — treat them as sensitive data.
 
-```bash
-cd backend
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-# Edit .env and add your GROQ_API_KEY
-uvicorn main:app --reload
-```
+Contact / Credits
+-----------------
+Built with FastAPI, Docker, and Groq LLMs. If you need help with deployment or an architecture walkthrough, open an issue or ping the maintainer.
 
-### Frontend
+---
 
-```bash
-cd frontend
-py -3 -m http.server 3000
-```
+Deep dive: retrieval & LLM orchestration
+---------------------------------------
 
-Open:
+This project intentionally blends multiple IR (information retrieval) and LLM engineering patterns to produce accurate, source-cited answers while controlling cost and abuse. Key concepts and components you will find in the codebase or that the system is designed to support:
 
-```text
-http://localhost:3000/login.html
-```
+- Chunking & tokenization: documents are split into overlapping passages (sliding window) to preserve local context and page-level citations.
+- Embeddings & dense vectors: passages are embedded into vector space for semantic search (compatible with SentenceTransformers-style embeddings).
+- BM25 (lexical retrieval): a fast, robust lexical candidate generator used in parallel with dense retrieval to capture exact-match signals.
+- Hybrid retrieval (lexical + semantic): the system merges BM25 candidates with dense nearest-neighbors for high recall.
+- ANN indices (HNSW/FAISS-compatible): the architecture supports approximate nearest neighbor indices for fast, scalable vector search.
+- Reranking / cross-encoder: a lightweight reranker reorders candidates using a context-aware cross-encoder to optimize precision@k before generation.
+- Late fusion / score fusion: lexical and semantic scores are combined using tunable weights to produce final candidates.
+- Citation metadata: every passage stores source metadata (filename, page, offset) so answers map back to exact evidence.
+- Prompt engineering & templates: retrieval context is inserted into a system prompt that instructs the LLM to ground answers and include inline citations.
+- Streaming & chunked generation: the backend streams tokens to the frontend (SSE-style) so the UI displays answers as they arrive and updates citations when meta messages appear.
+- Token budget & cost controls: the orchestration layer caps context size, truncates lower-quality passages, and enforces generation token limits per-request.
+- Rate limiting, circuit breakers, and concurrency limits: protects the LLM provider spend and enforces per-user/demo global quotas (Redis-backed when available).
 
-### Docker (full stack)
+Evaluation & metrics
+--------------------
 
-```bash
-# Copy and configure environment
-copy backend\.env.example backend\.env
-# Edit backend\.env and add your GROQ_API_KEY
+- Offline metrics: precision@k, recall@k, MRR, and nDCG are supported concepts for evaluating retrieval quality.
+- Human evaluation: the `services/evaluation.py` scaffolds manual grading of responses (quality, citation accuracy, hallucination rate).
+- Production metrics: latency (p50/p95), request error rate, and LLM token consumption are primary operational metrics to track.
 
-docker compose up --build
-```
+DevOps, observability, and CI/CD
+--------------------------------
 
-This starts all three services:
-- **Backend** at `http://localhost:8000`
-- **Redis** for rate limiting
-- **Frontend** at `http://localhost:3000`
+- Containerized: backend runs in Docker (Render uses the Dockerfile in `backend/`).
+- CI/CD: repository is CI-friendly (use GitHub Actions to lint, run unit tests, and optionally deploy).
+- Monitoring: designed to emit structured logs and metrics (compatible with OpenTelemetry / Prometheus + Grafana). Add Sentry for error tracking.
+- Health checks: `/health` returns service status and is used by Render for uptime checks.
 
-## Environment
+Security & privacy (expanded)
+-----------------------------
 
-Copy `backend/.env.example` to `backend/.env`.
+- Authentication: JWT tokens secure API endpoints; rotate `JWT_SECRET` in production.
+- Transport security: always use HTTPS in production (Vercel and Render provide TLS by default).
+- CSP & headers: `X-Frame-Options`, `X-Content-Type-Options`, and `Referrer-Policy` headers are set via `vercel.json` and `render.yaml` headers.
+- Data retention: uploaded PDFs live on the Render persistent disk by default — purge or encrypt if storing sensitive PHI.
 
-Required values:
+Buzzwords & technologies mentioned
+----------------------------------
 
-| Variable | Description |
-|----------|-------------|
-| `JWT_SECRET` | **Must change for production.** Auto-generated if deployed via `render.yaml`. |
-| `GROQ_API_KEY` | Your Groq API key for LLM inference. Get one at [console.groq.com](https://console.groq.com). |
+BM25, TF–IDF, tokenization, SentenceTransformers, embeddings, dense retrieval, FAISS, HNSW, approximate nearest neighbor (ANN), cosine similarity, cross-encoder reranking, late fusion, hybrid search, chunking, sliding window, passage-level citation, prompt templates, system prompt, instruction tuning, streaming SSE, server-sent events, JWT, Redis, rate limiting, token bucket, circuit breaker, backpressure, token budgeting, vector quantization, index sharding, batched embeddings, batching, concurrency limits, OpenTelemetry, Prometheus, Grafana, Sentry, GitHub Actions, Docker, Render, Vercel, Groq, nDCG, precision@k, recall@k, MRR.
 
-Optional values:
+Want images instead of Mermaid?
+--------------------------------
+If you prefer PNG/SVG images for the diagrams (useful for README rendering on platforms without Mermaid support), I can render the Mermaid diagrams to SVG/PNG and add them to `docs/` and reference them in this README.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `DATABASE_URL` | `sqlite:///./data/app.db` | SQLite path. Render uses a persistent disk at `/app/data`. |
-| `REDIS_URL` | *(unset)* | Redis connection string. If unset, in-memory rate limiting is used. |
-| `GROQ_MODEL` | `llama-3.1-8b-instant` | Groq model to use. |
-| `FRONTEND_ORIGINS` | `http://localhost:3000,...` | Comma-separated CORS origins. Add your deployed frontend URL. |
-
-No API keys are hardcoded. `.env` is ignored by git.
-
-## Deployment
-
-### Backend → Render
-
-**Option A: One-click deploy (recommended)**
-
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Ari-Han-t/TrialSight-Intelligence)
-
-This uses the `render.yaml` blueprint which auto-configures:
-- Docker-based web service on the free tier
-- Auto-generated `JWT_SECRET`
-- 1 GB persistent disk for SQLite data
-- Health check at `/health`
-
-After deploy, set `GROQ_API_KEY` in the Render dashboard under Environment.
-
-**Option B: Manual setup**
-
-1. Create a new **Web Service** on [render.com](https://render.com)
-2. Connect your GitHub repository
-3. Set:
-   - **Root Directory:** `backend`
-   - **Runtime:** Docker
-   - **Health Check Path:** `/health`
-4. Add environment variables:
-   - `APP_ENV=production`
-   - `JWT_SECRET=<generate a strong random string>`
-   - `GROQ_API_KEY=<your key>`
-   - `FRONTEND_ORIGINS=https://<your-vercel-app>.vercel.app`
-5. Add a **Disk** mounted at `/app/data` (1 GB)
-6. Deploy
-
-Your backend will be live at `https://<service-name>.onrender.com`.
-
-### Frontend → Vercel
-
-1. Go to [vercel.com/new](https://vercel.com/new), import this repository
-2. Set **Root Directory** to `frontend`
-3. Set **Framework Preset** to `Other`
-4. Deploy
-
-After deploying:
-
-1. Open `frontend/config.js` and set `apiBase` to your Render backend URL:
-   ```js
-   window.TRIALSIGHT_CONFIG = {
-     apiBase: "https://<your-render-service>.onrender.com",
-   };
-   ```
-2. Commit and push — Vercel will auto-redeploy.
-3. Add your Vercel URL to the `FRONTEND_ORIGINS` env var on Render.
-
-### Post-deployment checklist
-
-- [ ] `GROQ_API_KEY` is set on Render
-- [ ] `JWT_SECRET` is not the default value
-- [ ] `FRONTEND_ORIGINS` includes your Vercel URL
-- [ ] `config.js` `apiBase` points to your Render URL
-- [ ] Health check passes: `curl https://<service>.onrender.com/health`
-- [ ] Sign up, upload a PDF, and run a query end-to-end
-
-## Interview Pitch
-
-TrialSight Intelligence is a domain-focused RAG application for clinical evidence review. Instead of building a generic chatbot, this project wraps an LLM in a retrieval, security, and cost-control layer so users can query their own document corpus with grounded answers, citations, persistence, and abuse protection.
-
-In short: it shows product thinking, backend architecture, RAG design, multi-user isolation, and deployment awareness in one project.
+---
+_This README was updated to include the live frontend and backend URLs, architecture diagrams, an expanded developer guide, and a deep dive with retrieval/LLM buzzwords._
