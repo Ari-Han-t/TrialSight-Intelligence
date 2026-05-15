@@ -22,7 +22,7 @@ services:
       - key: GROQ_MODEL
         value: llama-3.1-8b-instant
       - key: FRONTEND_ORIGINS
-        value: https://trialsight-intelligence.vercel.app,http://localhost:3000
+        value: https://trial-sight-intelligence.vercel.app,https://trialsight-intelligence.vercel.app,http://localhost:3000
     disk:
       name: data
       mountPath: /app/data
