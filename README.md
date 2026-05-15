@@ -24,17 +24,20 @@ Mermaid component diagram
 
 ```mermaid
 graph LR
-  U["User Browser (Vercel Frontend)"] -->|HTTP(S)| CDN["Vercel CDN"]
-  CDN --> F["Static Frontend Files"]
-  F -->|HTTPS: /auth, /upload, /ask| B["Render Backend (FastAPI)"]
-  B --> DB["SQLite on persistent disk"]
-  B --> RD["Redis (optional) - rate limiting"]
-  B --> LLM["Groq LLM API"]
-  B -->|stores| Index["Document Index (vectors + metadata)"]
-  subgraph Cloud
-    LLM
-    RD
-  end
+    U["User Browser (Vercel Frontend)"] -->|HTTPS| CDN["Vercel CDN"]
+    CDN --> F["Static Frontend Files"]
+
+    F -->|API Requests: /auth, /upload, /ask| B["Render Backend (FastAPI)"]
+
+    B --> DB["SQLite Database (Persistent Disk)"]
+    B --> RD["Redis (Optional - Rate Limiting / Caching)"]
+    B --> LLM["Groq LLM API"]
+    B --> IDX["Document Index (Vectors + Metadata)"]
+
+    subgraph Cloud_Services
+        LLM
+        RD
+    end
 ```
 
 Sequence: ask -> retrieve -> answer
