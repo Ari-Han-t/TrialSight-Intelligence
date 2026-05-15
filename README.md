@@ -4,7 +4,6 @@ Clinical Trial Evidence Assistant — a product-focused RAG system for secure, c
 
 Live demo
 - Frontend (Vercel): https://trial-sight-intelligence.vercel.app/login?v=3
-- Backend (Render): https://trialsight-intelligence.onrender.com
 
 Summary
 -------
