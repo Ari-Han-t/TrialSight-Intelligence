@@ -210,14 +210,6 @@ Security & privacy (expanded)
 - CSP & headers: `X-Frame-Options`, `X-Content-Type-Options`, and `Referrer-Policy` headers are set via `vercel.json` and `render.yaml` headers.
 - Data retention: uploaded PDFs live on the Render persistent disk by default — purge or encrypt if storing sensitive PHI.
 
-Buzzwords & technologies mentioned
-----------------------------------
-
-BM25, TF–IDF, tokenization, SentenceTransformers, embeddings, dense retrieval, FAISS, HNSW, approximate nearest neighbor (ANN), cosine similarity, cross-encoder reranking, late fusion, hybrid search, chunking, sliding window, passage-level citation, prompt templates, system prompt, instruction tuning, streaming SSE, server-sent events, JWT, Redis, rate limiting, token bucket, circuit breaker, backpressure, token budgeting, vector quantization, index sharding, batched embeddings, batching, concurrency limits, OpenTelemetry, Prometheus, Grafana, Sentry, GitHub Actions, Docker, Render, Vercel, Groq, nDCG, precision@k, recall@k, MRR.
-
-Want images instead of Mermaid?
---------------------------------
-If you prefer PNG/SVG images for the diagrams (useful for README rendering on platforms without Mermaid support), I can render the Mermaid diagrams to SVG/PNG and add them to `docs/` and reference them in this README.
 
 ---
 _This README was updated to include the live frontend and backend URLs, architecture diagrams, an expanded developer guide, and a deep dive with retrieval/LLM buzzwords._
