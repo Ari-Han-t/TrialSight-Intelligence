@@ -22,5 +22,7 @@ USER appuser
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://localhost:%s/health' % os.environ.get('PORT', '8000'))" || exit 1
+# Never run a public instance on the built-in default JWT secret: generate one per boot
+# unless JWT_SECRET is supplied (e.g. as a hosting-platform secret).
+CMD ["sh", "-c", "export JWT_SECRET=\"${JWT_SECRET:-$(python -c 'import secrets; print(secrets.token_hex(32))')}\"; exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]

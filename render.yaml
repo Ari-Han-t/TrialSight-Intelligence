@@ -1,29 +1,24 @@
+# Free-tier deployment: one container serves the API and the UI on the same origin.
+# Free instances have no persistent disk, so uploads reset when the service restarts.
 services:
   - type: web
     name: trialsight-intelligence
     runtime: docker
-    dockerfilePath: ./backend/Dockerfile
-    dockerContext: ./backend
     plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: APP_ENV
         value: production
       - key: JWT_SECRET
         generateValue: true
-      - key: DATABASE_URL
-        value: sqlite:///./data/app.db
-      - key: UPLOAD_DIR
-        value: ./data/uploads
+      - key: SERVE_FRONTEND
+        value: "true"
       - key: LLM_PROVIDER
         value: groq
-      - key: GROQ_API_KEY
+      - key: GROQ_API_KEY      # optional: without it answers are extractive with citations
         sync: false
-      - key: GROQ_MODEL
-        value: llama-3.1-8b-instant
-      - key: FRONTEND_ORIGINS
-        value: https://trial-sight-intelligence.vercel.app,https://trialsight-intelligence.vercel.app,http://localhost:3000
-    disk:
-      name: data
-      mountPath: /app/data
-      sizeGB: 1
+      - key: EMBEDDING_PROVIDER
+        value: hash
