@@ -18,7 +18,10 @@ class Settings(BaseSettings):
 
     llm_provider: str = "groq"
     groq_api_key: str | None = None
-    groq_model: str = "llama-3.1-8b-instant"
+    # Groq retired the Llama 3.x models on 2026-08-16; gpt-oss-120b is its recommended replacement.
+    groq_model: str = "openai/gpt-oss-120b"
+    # Extra completion tokens reserved for a reasoning model's hidden thinking.
+    groq_reasoning_token_headroom: int = 1024
 
     dense_vector_size: int = 768
 

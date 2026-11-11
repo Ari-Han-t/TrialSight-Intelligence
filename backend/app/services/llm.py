@@ -225,12 +225,23 @@ class GroqLLMService(ChatLLMService):
     def _messages(self, system: str, user: str) -> list[dict]:
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
+    def _token_options(self, max_tokens: int) -> dict:
+        """Reasoning models (gpt-oss) think before answering, and those hidden tokens count
+        towards max_completion_tokens. Keep reasoning short and give it its own headroom so
+        the visible answer still gets the full `max_tokens` budget."""
+        if self.model.startswith("openai/gpt-oss"):
+            return {
+                "max_completion_tokens": max_tokens + settings.groq_reasoning_token_headroom,
+                "extra_body": {"reasoning_effort": "low"},
+            }
+        return {"max_completion_tokens": max_tokens}
+
     def _complete(self, *, system: str, user: str, max_tokens: int, temperature: float) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
             temperature=temperature,
-            max_completion_tokens=max_tokens,
             messages=self._messages(system, user),
+            **self._token_options(max_tokens),
         )
         return response.choices[0].message.content or ""
 
@@ -238,9 +249,9 @@ class GroqLLMService(ChatLLMService):
         stream = self.client.chat.completions.create(
             model=self.model,
             temperature=temperature,
-            max_completion_tokens=max_tokens,
             stream=True,
             messages=self._messages(system, user),
+            **self._token_options(max_tokens),
         )
         for item in stream:
             if item.choices and item.choices[0].delta.content:
