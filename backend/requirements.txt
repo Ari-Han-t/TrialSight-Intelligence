@@ -14,3 +14,4 @@ rank-bm25==0.2.2
 pypdf==5.4.0
 python-multipart==0.0.20
 httpx==0.28.1
+boto3>=1.35,<2

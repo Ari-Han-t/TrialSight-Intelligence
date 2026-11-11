@@ -15,7 +15,15 @@ Highlights
 - Streaming, citation-aware answers (SSE/streaming API)
 - JWT-based auth and per-user data isolation
 - Cost controls and rate limiting (Redis optional)
-- Simple deploy path: Render (backend) + Vercel (frontend)
+- Simple deploy path: Render (backend) + Vercel (frontend), or a single container on AWS
+
+AWS upgrade (Bedrock)
+---------------------
+- **Real semantic embeddings.** `EMBEDDING_PROVIDER=bedrock` embeds every chunk with Amazon Titan Text Embeddings V2 (512-d) once at ingest and stores the vector with the chunk. Previously the "dense" score came from a hashed bag-of-words that was recomputed for every chunk on every query; queries now cost one embedding call. Chunks embedded by a different model fall back to the lexical hash vector, and existing databases gain the new columns automatically on startup.
+- **Claude on Bedrock.** `LLM_PROVIDER=bedrock` answers through the Bedrock Converse / ConverseStream APIs (default `us.anthropic.claude-haiku-4-5-20251001-v1:0`). Credentials come from the AWS credential chain, so on EC2 the instance role is used and no model API key is stored anywhere. Groq remains supported; all providers share the same per-minute/per-day request and token budgets and concurrency cap.
+- **Clinical prompts.** Query rewriting and answering are tuned for protocols, CSRs and publications: keep drugs, arms, doses, endpoints and statistics; quote numbers precisely; say plainly when the passages don't contain the answer.
+- **Single-origin deploy.** `SERVE_FRONTEND=true` serves the UI from the API process (root `Dockerfile`), so no CORS or separate static host is needed. `GET /config` reports the active LLM provider and embedder.
+- **Security fix.** Uploaded filenames are reduced to their basename before being written to disk. Previously a crafted multipart filename such as `../<other-user-id>/report.pdf` was joined into the storage path.
 
 Architecture (high level)
 -------------------------

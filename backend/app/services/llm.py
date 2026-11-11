@@ -1,20 +1,51 @@
+"""LLM orchestration with provider-agnostic budget guards.
+
+Providers:
+- ``bedrock`` : Anthropic Claude (or any Converse-compatible model) on Amazon Bedrock. Uses the
+               standard AWS credential chain, so on EC2/ECS it authenticates through the attached
+               IAM role and no API key ever lives in the app's environment.
+- ``groq``    : Groq-hosted Llama models via API key.
+- fallback    : extractive answer from the top passages when no provider is configured.
+"""
+
+from __future__ import annotations
+
 import json
+import logging
 import threading
-from typing import Generator
+from typing import Generator, Iterator
 
 from fastapi import HTTPException, status
-from groq import Groq
 
 from app.core.config import get_settings
 from app.rag.chunking import estimate_tokens
 from app.rate_limit.store import rate_limit_store
 
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
-groq_semaphore = threading.BoundedSemaphore(value=settings.groq_max_concurrent_requests)
+provider_semaphore = threading.BoundedSemaphore(value=settings.groq_max_concurrent_requests)
+
+REWRITE_SYSTEM = (
+    "Rewrite the user's question into a concise retrieval query for searching clinical trial documents "
+    "(protocols, CSRs, publications). Keep drug names, populations, endpoints, arms, doses, timepoints and "
+    "statistical terms. Return only the rewritten query."
+)
+ANSWER_SYSTEM = (
+    "You are a clinical trial evidence analyst. Answer ONLY from the supplied passages. "
+    "Be concise and precise with numbers (effect sizes, CIs, p-values, n). Cite every key statement "
+    "with its passage label, e.g. [trial.pdf p.4]. If the passages do not contain the answer, say so "
+    "plainly instead of guessing, and note any uncertainty or limitations."
+)
+SCORE_SYSTEM = (
+    "Score the answer quality from 0 to 1 as JSON with a single key `score`, based only on factual "
+    "support from the provided context. Return only the JSON object."
+)
 
 
 class BaseLLMService:
+    provider = "none"
+
     def rewrite_query(self, question: str) -> str:
         return question
 
@@ -33,203 +64,232 @@ class BaseLLMService:
 
 
 class FallbackLLMService(BaseLLMService):
+    provider = "extractive"
+
     def answer(self, *, question: str, rewritten_query: str, contexts: list[dict]) -> str:
-        top = contexts[:3]
-        lines = ["Provider key not configured, returning extractive answer from the most relevant passages."]
-        for item in top:
-            lines.append(f"- {item['citation']}: {item['text'][:420].strip()}")
+        lines = ["No LLM provider is configured, so here are the most relevant passages verbatim:"]
+        for item in contexts[:3]:
+            lines.append(f"- [{item['citation']}] {item['text'][:420].strip()}")
         return "\n".join(lines)
 
 
-class GroqLLMService(BaseLLMService):
-    def __init__(self, api_key: str, model: str) -> None:
-        self.client = Groq(api_key=api_key)
-        self.model = model
+class ChatLLMService(BaseLLMService):
+    """Shared prompting, budget guards and error mapping. Subclasses implement two primitives."""
 
+    provider = "chat"
+
+    # ---- provider primitives -------------------------------------------------
+    def _complete(self, *, system: str, user: str, max_tokens: int, temperature: float) -> str:
+        raise NotImplementedError
+
+    def _stream(self, *, system: str, user: str, max_tokens: int, temperature: float) -> Iterator[str]:
+        raise NotImplementedError
+
+    # ---- pipeline ------------------------------------------------------------
     def rewrite_query(self, question: str) -> str:
         self._guard_budget(input_tokens=estimate_tokens(question), output_tokens=80)
         try:
-            with self._groq_slot():
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=0,
-                    max_completion_tokens=80,
-                    messages=[
-                        {"role": "system", "content": "Rewrite the user question into a concise retrieval query for academic paper search. Keep named entities, methods, metrics, and constraints. Return only the rewritten query."},
-                        {"role": "user", "content": question},
-                    ],
-                )
+            with self._slot():
+                text = self._complete(system=REWRITE_SYSTEM, user=question, max_tokens=80, temperature=0)
+        except HTTPException:
+            raise
         except Exception as exc:
-            self._raise_provider_error(exc)
-        return (response.choices[0].message.content or question).strip()
+            if self._is_throttle(exc):
+                self._raise_provider_error(exc)
+            logger.warning("%s rewrite failed (%s); using the original question", self.provider, type(exc).__name__)
+            return question
+        return (text or question).strip()
+
+    def _answer_prompt(self, question: str, rewritten_query: str, contexts: list[dict]) -> tuple[str, int]:
+        user = (
+            f"Original question:\n{question}\n\nRewritten retrieval query:\n{rewritten_query}\n\n"
+            f"Context passages:\n{self._context_block(contexts)}"
+        )
+        return user, estimate_tokens(user)
 
     def answer(self, *, question: str, rewritten_query: str, contexts: list[dict]) -> str:
-        prompt_tokens = estimate_tokens(question) + estimate_tokens(rewritten_query) + estimate_tokens(self._context_block(contexts))
+        user, prompt_tokens = self._answer_prompt(question, rewritten_query, contexts)
         self._guard_budget(input_tokens=prompt_tokens, output_tokens=settings.max_generation_tokens)
         try:
-            with self._groq_slot():
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=0.1,
-                    max_completion_tokens=settings.max_generation_tokens,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an AI research paper analyst. Answer only from the supplied passages. Keep the answer concise, mention uncertainty, and cite every key statement like [paper.pdf p.4].",
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Original question:\n{question}\n\nRewritten retrieval query:\n{rewritten_query}\n\nContext passages:\n{self._context_block(contexts)}",
-                        },
-                    ],
+            with self._slot():
+                text = self._complete(
+                    system=ANSWER_SYSTEM, user=user, max_tokens=settings.max_generation_tokens, temperature=0.1
                 )
+        except HTTPException:
+            raise
         except Exception as exc:
-            self._raise_provider_error(exc)
-        return (response.choices[0].message.content or "").strip()
+            if self._is_throttle(exc):
+                self._raise_provider_error(exc)
+            return self._degraded_answer(exc, question, rewritten_query, contexts)
+        return (text or "").strip()
 
     def stream_answer(self, *, question: str, rewritten_query: str, contexts: list[dict]) -> Generator[str, None, None]:
-        prompt_tokens = estimate_tokens(question) + estimate_tokens(rewritten_query) + estimate_tokens(self._context_block(contexts))
+        user, prompt_tokens = self._answer_prompt(question, rewritten_query, contexts)
         self._guard_budget(input_tokens=prompt_tokens, output_tokens=settings.max_generation_tokens)
+        produced = False
         try:
-            with self._groq_slot():
-                stream = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=0.1,
-                    max_completion_tokens=settings.max_generation_tokens,
-                    stream=True,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an AI research paper analyst. Answer only from the supplied passages. Keep the answer concise, mention uncertainty, and cite every key statement like [paper.pdf p.4].",
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Original question:\n{question}\n\nRewritten retrieval query:\n{rewritten_query}\n\nContext passages:\n{self._context_block(contexts)}",
-                        },
-                    ],
-                )
-                for item in stream:
-                    if item.choices and item.choices[0].delta.content:
-                        yield item.choices[0].delta.content
+            with self._slot():
+                for piece in self._stream(
+                    system=ANSWER_SYSTEM, user=user, max_tokens=settings.max_generation_tokens, temperature=0.1
+                ):
+                    produced = True
+                    yield piece
+        except HTTPException:
+            raise
         except Exception as exc:
-            self._raise_provider_error(exc)
+            if produced or self._is_throttle(exc):
+                self._raise_provider_error(exc)
+            yield self._degraded_answer(exc, question, rewritten_query, contexts)
 
     def score_answer(self, *, question: str, answer: str, contexts: list[dict]) -> float | None:
         if not settings.groq_answer_scoring_enabled:
             return None
-        prompt_tokens = estimate_tokens(question) + estimate_tokens(answer) + estimate_tokens(self._context_block(contexts))
-        self._guard_budget(input_tokens=prompt_tokens, output_tokens=60)
+        user = f"Question: {question}\n\nAnswer: {answer}\n\nContext:\n{self._context_block(contexts)}"
+        self._guard_budget(input_tokens=estimate_tokens(user), output_tokens=60)
         try:
-            with self._groq_slot():
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    temperature=0,
-                    max_completion_tokens=60,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "Score the answer quality from 0 to 1 as JSON with key score, based only on factual support from the provided context.",
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Question: {question}\n\nAnswer: {answer}\n\nContext:\n{self._context_block(contexts)}",
-                        },
-                    ],
-                )
-        except Exception as exc:
-            self._raise_provider_error(exc)
-        content = response.choices[0].message.content or "{\"score\": null}"
+            with self._slot():
+                content = self._complete(system=SCORE_SYSTEM, user=user, max_tokens=60, temperature=0)
+        except Exception:
+            return None
         try:
-            payload = json.loads(content)
-            value = payload.get("score")
+            start, end = content.find("{"), content.rfind("}")
+            value = json.loads(content[start : end + 1]).get("score")
             return round(float(value), 4) if value is not None else None
         except Exception:
             return None
 
+    # ---- guards ----------------------------------------------------------------
     def _guard_budget(self, *, input_tokens: int, output_tokens: int) -> None:
-        estimated_total_tokens = max(input_tokens + output_tokens, 1)
-        request_minute = rate_limit_store.hit(
-            key="groq:requests:minute",
-            limit=settings.groq_requests_per_minute,
-            window_seconds=60,
-        )
-        if not request_minute["allowed"]:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Groq request budget exhausted for this minute. Please retry shortly.",
-            )
+        total = max(input_tokens + output_tokens, 1)
+        checks = [
+            ("llm:requests:minute", settings.groq_requests_per_minute, 60, 1, "LLM request budget exhausted for this minute. Please retry shortly."),
+            ("llm:requests:day", settings.groq_requests_per_day, 86400, 1, "LLM daily request budget exhausted for this demo."),
+            ("llm:tokens:minute", settings.groq_tokens_per_minute, 60, total, "LLM token budget exhausted for this minute. Please retry shortly."),
+            ("llm:tokens:day", settings.groq_tokens_per_day, 86400, total, "LLM daily token budget exhausted for this demo."),
+        ]
+        for key, limit, window, amount, message in checks:
+            result = rate_limit_store.hit(key=key, limit=limit, window_seconds=window, amount=amount)
+            if not result["allowed"]:
+                raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=message)
 
-        request_day = rate_limit_store.hit(
-            key="groq:requests:day",
-            limit=settings.groq_requests_per_day,
-            window_seconds=86400,
-        )
-        if not request_day["allowed"]:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Groq daily request budget exhausted for this demo.",
-            )
-
-        token_minute = rate_limit_store.hit(
-            key="groq:tokens:minute",
-            limit=settings.groq_tokens_per_minute,
-            window_seconds=60,
-            amount=estimated_total_tokens,
-        )
-        if not token_minute["allowed"]:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Groq token budget exhausted for this minute. Please retry shortly.",
-            )
-
-        token_day = rate_limit_store.hit(
-            key="groq:tokens:day",
-            limit=settings.groq_tokens_per_day,
-            window_seconds=86400,
-            amount=estimated_total_tokens,
-        )
-        if not token_day["allowed"]:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Groq daily token budget exhausted for this demo.",
-            )
-
-    def _groq_slot(self):
-        service = self
-
+    @staticmethod
+    def _slot():
         class _Slot:
             def __enter__(self_inner):
-                acquired = groq_semaphore.acquire(timeout=5)
-                if not acquired:
+                if not provider_semaphore.acquire(timeout=5):
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="Groq concurrency budget exhausted. Please retry shortly.",
+                        detail="LLM concurrency budget exhausted. Please retry shortly.",
                     )
-                return service
+                return self_inner
 
             def __exit__(self_inner, exc_type, exc, tb):
-                groq_semaphore.release()
+                provider_semaphore.release()
 
         return _Slot()
 
     @staticmethod
-    def _raise_provider_error(exc: Exception) -> None:
+    def _is_throttle(exc: Exception) -> bool:
         message = str(exc).lower()
-        if "429" in message or "rate limit" in message:
+        return "429" in message or "rate limit" in message or "throttl" in message
+
+    def _degraded_answer(self, exc: Exception, question: str, rewritten_query: str, contexts: list[dict]) -> str:
+        """Provider unavailable (e.g. model access not yet granted): still return cited evidence."""
+        logger.warning("%s answer failed (%s); serving extractive answer", self.provider, type(exc).__name__)
+        return FallbackLLMService().answer(question=question, rewritten_query=rewritten_query, contexts=contexts).replace(
+            "No LLM provider is configured", f"The {self.provider} model is unavailable right now", 1
+        )
+
+    def _raise_provider_error(self, exc: Exception) -> None:
+        logger.warning("%s provider error: %s", self.provider, exc)
+        if self._is_throttle(exc):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Groq is rate limiting this demo right now. Please retry shortly.",
+                detail=f"The {self.provider} model is rate limiting this demo right now. Please retry shortly.",
             ) from exc
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Groq is temporarily unavailable for this demo.",
+            detail=f"The {self.provider} model is temporarily unavailable for this demo.",
         ) from exc
 
 
+class GroqLLMService(ChatLLMService):
+    provider = "groq"
+
+    def __init__(self, api_key: str, model: str) -> None:
+        from groq import Groq
+
+        self.client = Groq(api_key=api_key)
+        self.model = model
+
+    def _messages(self, system: str, user: str) -> list[dict]:
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def _complete(self, *, system: str, user: str, max_tokens: int, temperature: float) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=temperature,
+            max_completion_tokens=max_tokens,
+            messages=self._messages(system, user),
+        )
+        return response.choices[0].message.content or ""
+
+    def _stream(self, *, system: str, user: str, max_tokens: int, temperature: float) -> Iterator[str]:
+        stream = self.client.chat.completions.create(
+            model=self.model,
+            temperature=temperature,
+            max_completion_tokens=max_tokens,
+            stream=True,
+            messages=self._messages(system, user),
+        )
+        for item in stream:
+            if item.choices and item.choices[0].delta.content:
+                yield item.choices[0].delta.content
+
+
+class BedrockLLMService(ChatLLMService):
+    provider = "bedrock"
+
+    def __init__(self, model_id: str, region: str | None) -> None:
+        import boto3
+        from botocore.config import Config
+
+        self.client = boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(retries={"max_attempts": 3, "mode": "adaptive"}, read_timeout=60),
+        )
+        self.model_id = model_id
+
+    def _request(self, system: str, user: str, max_tokens: int, temperature: float) -> dict:
+        return {
+            "modelId": self.model_id,
+            "system": [{"text": system}],
+            "messages": [{"role": "user", "content": [{"text": user}]}],
+            "inferenceConfig": {"maxTokens": max_tokens, "temperature": temperature},
+        }
+
+    def _complete(self, *, system: str, user: str, max_tokens: int, temperature: float) -> str:
+        response = self.client.converse(**self._request(system, user, max_tokens, temperature))
+        blocks = response["output"]["message"]["content"]
+        return "".join(block.get("text", "") for block in blocks)
+
+    def _stream(self, *, system: str, user: str, max_tokens: int, temperature: float) -> Iterator[str]:
+        response = self.client.converse_stream(**self._request(system, user, max_tokens, temperature))
+        for event in response["stream"]:
+            delta = event.get("contentBlockDelta", {}).get("delta", {})
+            if delta.get("text"):
+                yield delta["text"]
+
+
 def _build_service() -> BaseLLMService:
-    if settings.llm_provider == "groq" and settings.groq_api_key:
-        return GroqLLMService(api_key=settings.groq_api_key, model=settings.groq_model)
+    try:
+        if settings.llm_provider == "bedrock":
+            return BedrockLLMService(model_id=settings.bedrock_model_id, region=settings.aws_region)
+        if settings.llm_provider == "groq" and settings.groq_api_key:
+            return GroqLLMService(api_key=settings.groq_api_key, model=settings.groq_model)
+    except Exception:  # pragma: no cover - depends on environment
+        logger.exception("Configured LLM provider %s unavailable; using extractive fallback", settings.llm_provider)
     return FallbackLLMService()
 
 

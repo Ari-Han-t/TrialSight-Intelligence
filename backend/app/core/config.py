@@ -22,6 +22,18 @@ class Settings(BaseSettings):
 
     dense_vector_size: int = 768
 
+    # Amazon Bedrock (used when llm_provider / embedding_provider == "bedrock").
+    # Credentials come from the standard AWS chain (EC2 instance role in production).
+    aws_region: str | None = None
+    bedrock_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    embedding_provider: str = "hash"
+    bedrock_embedding_model_id: str = "amazon.titan-embed-text-v2:0"
+    bedrock_embedding_dim: int = 512
+
+    # Serve the static frontend from the API process (single-origin deploy, no CORS needed).
+    serve_frontend: bool = False
+    frontend_dir: str = "./frontend"
+
     max_file_size_bytes: int = 10 * 1024 * 1024
     max_uploads_per_day: int = 5
     max_files_per_upload: int = 1

@@ -16,6 +16,7 @@ from app.core.security import new_id
 from app.models.db import Chunk, Document, QueryCache, QueryLog
 from app.rag.chunking import chunk_page_text, tokenize
 from app.schemas.rag import Citation, EvaluationSummary
+from app.services.embeddings import embed_documents_safe, from_bytes, query_vectors, to_bytes
 
 
 settings = get_settings()
@@ -29,6 +30,8 @@ class RetrievalService:
         return "I do not have enough paper context to answer that yet. Upload a relevant PDF or ask a more specific question."
 
     def index_pdf(self, *, db: Session, user_id: str, filename: str, file_bytes: bytes) -> dict:
+        # Never trust a client-supplied filename as a path component (e.g. "../../app/main.py").
+        filename = Path(filename.replace("\\", "/")).name.strip() or "document.pdf"
         pages = self._extract_pdf_pages(file_bytes)
         if not pages:
             raise ValueError(f"No extractable text found in {filename}")
@@ -63,6 +66,11 @@ class RetrievalService:
 
         if not records:
             raise ValueError(f"No chunks generated for {filename}")
+
+        vectors, embedder_name = embed_documents_safe([r.text for r in records])
+        for record, vector in zip(records, vectors):
+            record.embedding = to_bytes(vector)
+            record.embedding_model = embedder_name
 
         db.add_all(records)
         document.chunk_count = len(records)
@@ -160,11 +168,16 @@ class RetrievalService:
         return pages
 
     def _dense_search(self, *, rows: list[Chunk], query: str) -> list[dict]:
-        query_vector = self._dense_vector(tokenize(query))
+        query_by_model = query_vectors(query)
         hits: list[dict] = []
         for row in rows:
-            row_vector = self._dense_vector(tokenize(row.text))
-            score = self._cosine_similarity(query_vector, row_vector)
+            query_vector = query_by_model.get(row.embedding_model or "")
+            row_vector = from_bytes(row.embedding) if query_vector is not None else None
+            if row_vector is None:
+                # Legacy chunk or embedder changed: fall back to the lexical hash vector for both sides.
+                score = self._cosine_similarity(self._dense_vector(tokenize(query)), self._dense_vector(tokenize(row.text)))
+            else:
+                score = self._cosine_similarity(query_vector, row_vector)
             hits.append(
                 {
                     "id": row.id,
@@ -256,7 +269,7 @@ class RetrievalService:
 
     @staticmethod
     def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
-        if not left.any() or not right.any():
+        if left.shape != right.shape or not left.any() or not right.any():
             return 0.0
         return float(np.clip(np.dot(left, right), 0.0, 1.0))
 

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.core.security import new_id
@@ -48,6 +48,9 @@ class Chunk(Base):
     token_count: Mapped[int] = mapped_column(Integer)
     citation: Mapped[str] = mapped_column(String(255))
     text: Mapped[str] = mapped_column(Text)
+    # Dense vector computed once at ingest (float32 bytes) and the embedder that produced it.
+    embedding: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(), default=utcnow)
 
 
